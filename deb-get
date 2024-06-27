@@ -3,7 +3,7 @@ LC_ALL=C
 PACKAGE_INSTALLATION_TRIES=0
 PACKAGE_INSTALLATION_COUNT=0
 
-readonly VERSION="0.4.0"
+readonly VERSION="0.4.1"
 
 # set a github auth token (e.g a PAT ) in DEBGET_TOKEN to get a bigger rate limit
 if [ -n "${DEBGET_TOKEN}" ]; then
@@ -148,6 +148,11 @@ function unroll_url() {
     printf '%s' "${TRIM_URL/\.deb*/.deb}"
 }
 
+function follow_url() {
+    local TRIM_URL="$(curl -w "%{url_effective}" -I -L -s -S "${1}" -o /dev/null)"
+    printf '%s' "${TRIM_URL}"
+}
+
 
 function get_github_releases() {
     METHOD="github"
@@ -172,13 +177,36 @@ function get_github_releases() {
     fi
 }
 
+function get_gitlab_releases() {
+    METHOD="gitlab"
+    CACHE_FILE="${CACHE_DIR}/${APP}.json"
+    # Cache gitlab releases json for 1 hour to try and prevent API rate limits
+    # 
+    # Do not process gitlab releases while generating a pretty list or upgrading
+    # if $1 is org/app or user/repo it must be urlencoded
+    # the gitlab api can take a release or use permalink/latest to get the latest release
+    # So for gitlab sourced apps that use this release model users can use 99-local to pin a version
+    # 
+
+    if [[ ' install update fix-installed ' =~ " ${ACTION} " ]]; then
+        if [ ! -e "${CACHE_FILE}" ] || [ -n "$(find "${CACHE_FILE}" -mmin +"${DEBGET_CACHE_RTN:-60}")" ]; then
+            fancy_message info "Updating ${CACHE_FILE}"
+            RELEASE=${2/%latest/permalink/latest}
+
+            local URL="https://gitlab.com/api/v4/projects/${1}/releases/${RELEASE}/assets/links" 
+            wgetcmdarray=(wget -q --no-use-server-timestamps "${URL}" -O "${CACHE_FILE}")
+            
+            ${ELEVATE} "${wgetcmdarray[@]}" || ( fancy_message warn "Updating ${CACHE_FILE} failed." )
+        fi
+    fi
+}
 function get_website() {
     METHOD="website"
     CACHE_FILE="${CACHE_DIR}/${APP}.html"
     if [[ ' install update fix-installed ' =~ " ${ACTION} " ]]; then
         if [ ! -e "${CACHE_FILE}" ] || [ -n "$(find "${CACHE_FILE}" -mmin +"${DEBGET_CACHE_RTN:-60}")" ]; then
             fancy_message info "Updating ${CACHE_FILE}"
-            if ! ${ELEVATE} wget ${WGET_VERBOSITY} --no-use-server-timestamps ${WGET_TIMEOUT} "${1}" -O "${CACHE_FILE}"; then
+            if ! ${ELEVATE} wget ${WGET_VERBOSITY} --no-use-server-timestamps ${WGET_TIMEOUT} "$@" -O "${CACHE_FILE}"; then
                 fancy_message warn "Updating ${CACHE_FILE} failed. Deleting it."
                 ${ELEVATE} rm -f "${CACHE_FILE}"
             fi
@@ -348,7 +376,7 @@ function remove_deb() {
 
     # Remove repos/PPA/key even if the app is not installed.
     case "${METHOD}" in
-        direct|github|website)
+        direct|github|gitlab|website)
             if [ -f "${CACHE_DIR}/${FILE}" ]; then
                 fancy_message info "Removing ${CACHE_DIR}/${FILE}"
                 ${ELEVATE} rm "${CACHE_DIR}/${FILE}" 2>/dev/null
@@ -370,7 +398,7 @@ function version_deb() {
 function info_deb() {
     local INSTALLED="${VERSION_INSTALLED:-No}"
     case "${METHOD}" in
-        (direct|github|website)
+        (direct|github|gitlab|website)
             printf '%s\n' "${PRETTY_NAME}"
             printf '  %s:\t%s\n' Package "${APP}" Repository "${APP_SRC}" Updater deb-get Installed "${INSTALLED}" Published "${VERSION_PUBLISHED}" Architecture "${ARCHS_SUPPORTED}" Download "${URL}" Website "${WEBSITE}" Summary "${SUMMARY}";;
         (apt)
@@ -466,7 +494,7 @@ function validate_deb() {
             fi
         fi
 
-        if { { [[ ' github website ' =~ " ${METHOD} " ]] && [ -s "${CACHE_FILE}" ]; } || [ "${METHOD}" == direct ]; } &&
+        if { { [[ ' github website gitlab ' =~ " ${METHOD} " ]] && [ -s "${CACHE_FILE}" ]; } || [ "${METHOD}" == direct ]; } &&
            ! [[ ' prettylist remove purge ' =~ " ${ACTION} " ]] &&
            { [ -z "${URL}" ] || [ -z "${VERSION_PUBLISHED}" ]; } &&
            { [ -z "${ARCHS_SUPPORTED}" ] || [[ " ${ARCHS_SUPPORTED} " =~ " ${HOST_ARCH} " ]]; } &&
@@ -568,16 +596,16 @@ cat <<"EOMSG"
 | :------: | :------------- | :------------ |
 EOMSG
     for FULL_APP in "${APPS[@]}"; do
-        if validate_deb "${FULL_APP}"; then
-            if [ "${APP_SRC}" == "${REPO}" ] || { [ "${REPO}" == "01-main" ] && [ "${APP_SRC}" == "00-builtin" ]; }; then
-                case "${METHOD}" in
-                    apt)    ICON="debian.png";;
-                    github) ICON="github.png";;
-                    ppa)    ICON="launchpad.png";;
-                    *)      ICON="direct.png";;
-                esac
-                echo "| [<img src=\"../.github/${ICON}\" align=\"top\" width=\"20\" />](${WEBSITE}) | "'`'"${APP}"'`'" | <i>${SUMMARY}</i> |"
-            fi
+        validate_deb "${FULL_APP}"
+        if [ "${APP_SRC}" == "${REPO}" ] || { [ "${REPO}" == "01-main" ] && [ "${APP_SRC}" == "00-builtin" ]; }; then
+            case "${METHOD}" in
+                apt)    ICON="debian.png";;
+                github) ICON="github.png";;
+                gitlab) ICON="gitlab.png";;
+                ppa)    ICON="launchpad.png";;
+                *)      ICON="direct.png";;
+            esac
+            echo "| [<img src=\"../.github/${ICON}\" align=\"top\" width=\"20\" />](${WEBSITE}) | "'`'"${APP}"'`'" | <i>${SUMMARY}</i> |"
         fi
     done
 }
@@ -597,12 +625,11 @@ function update_debs() {
     local STATUS=""
     update_apt
     for APP in "${INSTALLED_APPS[@]}"; do
-        if validate_deb "${APPNAME2FULL[$APP]}"; then
-            if [ "${METHOD}" == "direct" ] || [ "${METHOD}" == "github" ] || [ "${METHOD}" == "website" ]; then
-                STATUS=$(dpkg-query -Wf '${Status}' "${APP}")
-                if [ "${STATUS}" == "install ok installed" ] && dpkg --compare-versions "${VERSION_PUBLISHED}" gt "${VERSION_INSTALLED}"; then
-                    fancy_message info "${APP} (${VERSION_INSTALLED}) has an update pending. ${VERSION_PUBLISHED} is available."
-                fi
+        validate_deb "${APPNAME2FULL[$APP]}"
+        if [ "${METHOD}" == "direct" ] || [ "${METHOD}" == "github" ] || [ "${METHOD}" == "gitlab" ] || [ "${METHOD}" == "website" ]; then
+            STATUS=$(dpkg-query -Wf '${Status}' "${APP}")
+            if [ "${STATUS}" == "install ok installed" ] && dpkg --compare-versions "${VERSION_PUBLISHED}" gt "${VERSION_INSTALLED}"; then
+                fancy_message info "${APP} (${VERSION_INSTALLED}) has an update pending. ${VERSION_PUBLISHED} is available."
             fi
         fi
     done
@@ -612,12 +639,11 @@ function upgrade_debs() {
     local STATUS=""
     upgrade_apt
     for APP in "${INSTALLED_APPS[@]}"; do
-        if validate_deb "${APPNAME2FULL[$APP]}"; then
-            if [ "${METHOD}" == "direct" ] || [ "${METHOD}" == "github" ] || [ "${METHOD}" == "website" ]; then
-                STATUS=$(dpkg-query -Wf '${Status}' "${APP}")
-                if [ "${STATUS}" == "install ok installed" ]; then
-                    install_deb "${URL}"
-                fi
+        validate_deb "${APPNAME2FULL[$APP]}"
+        if [ "${METHOD}" == "direct" ] || [ "${METHOD}" == "github" ]|| [ "${METHOD}" == "gitlab" ] || [ "${METHOD}" == "website" ]; then
+            STATUS=$(dpkg-query -Wf '${Status}' "${APP}")
+            if [ "${STATUS}" == "install ok installed" ]; then
+                install_deb "${URL}"
             fi
         fi
     done
@@ -640,19 +666,27 @@ function refresh_supported_cache_lists() {
     # WARN: this function must run in a subshell
     local lockfile=${CACHE_DIR}/updating_supported.lock
     if [ -f "$lockfile" ]; then
-        fancy_message warn "Cannot update cache of supported apps: $lockfile found (job still running?)"
-        return 0
-    else
-        trap "trap - EXIT; ${ELEVATE} rm -f \"$lockfile\"" EXIT
-        ${ELEVATE} touch "$lockfile"
-        ${ELEVATE} rm -f "${CACHE_DIR}/supported.list" "${CACHE_DIR}/supported_apps.list"
-        fancy_message info "Updating cache of supported apps in the background"
-        list_debs | grep -v -e '^[[:space:]][[:space:]]*\[' | ${ELEVATE} tee "${CACHE_DIR}/supported.list.tmp" >/dev/null
-        ${ELEVATE} mv "${CACHE_DIR}/supported.list.tmp" "${CACHE_DIR}/supported.list"
-        # # belt and braces no longer needed
-        #${ELEVATE} sed -i '/[+]/d' ${CACHE_DIR}/supported.list.tmp
-        cut -d" " -f 1 "${CACHE_DIR}/supported.list" | sort -u | ${ELEVATE} tee "${CACHE_DIR}/supported_apps.list" >/dev/null
+        pgrep -f "$DEBGET_BIN update"
+        if [ $? ]; then
+            # pgrep returned 1 (command not found), delete lockfile and continue
+            fancy_message warn "Lock file found, but job is not running. Deleting $lockfile, cache update continues."
+            ${ELEVATE} rm $lockfile
+        else
+            # pgrep returned 0 (command found), do nothing and return
+            fancy_message warn "Cannot update cache of supported apps: $lockfile found (job still running?)"
+            return 0
+        fi
     fi
+
+    trap "trap - EXIT; ${ELEVATE} rm -f \"$lockfile\"" EXIT
+    ${ELEVATE} touch "$lockfile"
+    ${ELEVATE} rm -f "${CACHE_DIR}/supported.list" "${CACHE_DIR}/supported_apps.list"
+    fancy_message info "Updating cache of supported apps in the background"
+    list_debs | grep -v -e '^[[:space:]][[:space:]]*\[' | ${ELEVATE} tee "${CACHE_DIR}/supported.list.tmp" >/dev/null
+    ${ELEVATE} mv "${CACHE_DIR}/supported.list.tmp" "${CACHE_DIR}/supported.list"
+    # # belt and braces no longer needed
+    #${ELEVATE} sed -i '/[+]/d' ${CACHE_DIR}/supported.list.tmp
+    cut -d" " -f 1 "${CACHE_DIR}/supported.list" | sort -u | ${ELEVATE} tee "${CACHE_DIR}/supported_apps.list" >/dev/null
 }
 
 function update_repos() {
@@ -669,7 +703,7 @@ function update_repos() {
         # export REPO ETC_DIR ELEVATE  # no longer needed, `| bash -` replaced with `eval`
         fancy_message info "Updating ${ETC_DIR}/${REPO}"
         REPO_URL="$(head -n 1 "${ETC_DIR}/${REPO}.repo")"
-        ${ELEVATE} wget ${WGET_VERBOSITY} ${WGET_TIMEOUT} "${REPO_URL}/manifest" -O "${ETC_DIR}/${REPO}.repo"
+        ${ELEVATE} wget ${WGET_VERBOSITY} ${WGET_TIMEOUT} "${REPO_URL}/manifest" -O "${ETC_DIR}/${REPO}.repo.tmp" && ${ELEVATE} mv "${ETC_DIR}/${REPO}.repo.tmp" "${ETC_DIR}/${REPO}.repo"
 
         # ${ELEVATE} rm "${ETC_DIR}/${REPO}.d/* # we currently leave old litter : either <- this or maybe rm older ones
         # although so long as manifest is good we are OK
@@ -1321,6 +1355,7 @@ case "${UPSTREAM_CODENAME}" in
     kinetic)  UPSTREAM_RELEASE="22.10";;
     lunar)    UPSTREAM_RELEASE="23.04";;
     mantic)   UPSTREAM_RELEASE="23.10";;
+    noble)    UPSTREAM_RELEASE="24.04";;
     *) fancy_message fatal "${OS_ID_PRETTY} ${OS_CODENAME^} is not supported because it is not derived from a supported Debian or Ubuntu release.";;
 esac
 }
@@ -1377,7 +1412,7 @@ function dg_action_install() {
                 fi
 
                 case "${METHOD}" in
-                    direct|github|website) install_deb "${URL}";;
+                    direct|github|gitlab|website) install_deb "${URL}";;
                     apt) install_apt;;
                     ppa) install_ppa;;
                 esac
@@ -1543,6 +1578,8 @@ readonly MAIN_REPO_URL="https://raw.githubusercontent.com/wimpysworld/deb-get/ma
 
 readonly USER_AGENT="Mozilla/5.0 (X11; Linux ${HOST_CPU}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36"
 readonly USER_HOME="${HOME}"
+
+readonly DEBGET_BIN=$(basename $0)
 
 parse_machine
 
